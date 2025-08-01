@@ -25,7 +25,7 @@ impl<E, W, B, S> ProcessorSettings<E, W> for SPBuilder<S, E, W, B> {
 impl<E, W, B, S> Builder<E, W, B> for SPBuilder<S, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	fn dependent_barrier(&self) -> Arc<B> {
@@ -36,7 +36,7 @@ where
 impl <E, W, B> SPBuilder<NC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	pub(super) fn new<F>(size: usize, event_factory: F, wait_strategy: W, producer_barrier: Arc<SingleProducerBarrier>, dependent_barrier: Arc<B>) -> Self
@@ -85,7 +85,7 @@ where
 impl <E, W, B> SPBuilder<SC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	/// Finish the build and get a [`SingleProducer`].
@@ -149,7 +149,7 @@ where
 impl <E, W, B> SPBuilder<MC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	/// Add an event handler.

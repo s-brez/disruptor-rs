@@ -25,7 +25,7 @@ impl<S, E, W, B> ProcessorSettings<E, W> for MPBuilder<S, E, W, B> {
 impl<S, E, W, B> Builder<E, W, B> for MPBuilder<S, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	fn dependent_barrier(&self) -> Arc<B> {
@@ -36,7 +36,7 @@ where
 impl <E, W, B> MPBuilder<NC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	pub(super) fn new<F>(size: usize, event_factory: F, wait_strategy: W, producer_barrier: Arc<MultiProducerBarrier>, dependent_barrier: Arc<B>) -> Self
@@ -85,7 +85,7 @@ where
 impl <E, W, B> MPBuilder<SC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	/// Add an event handler.
@@ -149,7 +149,7 @@ where
 impl <E, W, B> MPBuilder<MC, E, W, B>
 where
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 	B: 'static + Barrier,
 {
 	/// Add an event handler.

@@ -72,11 +72,11 @@ pub(crate) fn start_processor<E, EP, W, B> (
 where
 	E:  'static + Send + Sync,
 	EP: 'static + Send + FnMut(&E, Sequence, bool),
-	W:  'static + WaitStrategy,
+    W:  'static + WaitStrategy + Clone,
 	B:  'static + Barrier + Send + Sync,
 {
 	let consumer_cursor      = Arc::new(Cursor::new(-1));// Initially, the consumer has not read slot 0 yet.
-	let wait_strategy        = builder.wait_strategy;
+    let mut wait_strategy    = builder.wait_strategy.clone();
 	let ring_buffer          = Arc::clone(&builder.ring_buffer);
 	let shutdown_at_sequence = Arc::clone(&builder.shutdown_at_sequence);
 	let thread_name          = builder.thread_context.name();
@@ -87,7 +87,7 @@ where
 		thread_builder.spawn(move || {
 			set_affinity_if_defined(affinity, thread_name.as_str());
 			let mut sequence = 0;
-			while let Some(available) = wait_for_events(sequence, &shutdown_at_sequence, barrier.as_ref(), &wait_strategy) {
+            while let Some(available) = wait_for_events(sequence, &shutdown_at_sequence, barrier.as_ref(), &mut wait_strategy) {
 				while available >= sequence { // Potentiel batch processing.
 					let end_of_batch = available == sequence;
 					// SAFETY: Now, we have (shared) read access to the event at `sequence`.
@@ -117,11 +117,11 @@ where
 	E:  'static + Send + Sync,
 	IS: 'static + Send + FnOnce() -> S,
 	EP: 'static + Send + FnMut(&mut S, &E, Sequence, bool),
-	W:  'static + WaitStrategy,
+    W:  'static + WaitStrategy + Clone,
 	B:  'static + Barrier + Send + Sync,
 {
 	let consumer_cursor      = Arc::new(Cursor::new(-1));// Initially, the consumer has not read slot 0 yet.
-	let wait_strategy        = builder.wait_strategy;
+    let mut wait_strategy    = builder.wait_strategy.clone();
 	let ring_buffer          = Arc::clone(&builder.ring_buffer);
 	let shutdown_at_sequence = Arc::clone(&builder.shutdown_at_sequence);
 	let thread_name          = builder.thread_context.name();
@@ -133,7 +133,7 @@ where
 			set_affinity_if_defined(affinity, thread_name.as_str());
 			let mut sequence = 0;
 			let mut state    = initialize_state();
-			while let Some(available_sequence) = wait_for_events(sequence, &shutdown_at_sequence, barrier.as_ref(), &wait_strategy) {
+            while let Some(available_sequence) = wait_for_events(sequence, &shutdown_at_sequence, barrier.as_ref(), &mut wait_strategy) {
 				while available_sequence >= sequence { // Potentiel batch processing.
 					let end_of_batch = available_sequence == sequence;
 					// SAFETY: Now, we have (shared) read access to the event at `sequence`.
@@ -158,12 +158,12 @@ fn wait_for_events<B, W>(
 	sequence:             Sequence,
 	shutdown_at_sequence: &CachePadded<AtomicI64>,
 	barrier:              &B,
-	wait_strategy:        &W
+    wait_strategy:        &mut W
 )
 -> Option<Sequence>
 where
 	B: Barrier + Send + Sync,
-	W: WaitStrategy,
+    W: WaitStrategy,
 {
 	let mut available = barrier.get_after(sequence);
 	while available < sequence {
@@ -171,7 +171,7 @@ where
 		if shutdown_at_sequence.load(Ordering::Relaxed) == sequence {
 			return None;
 		}
-		wait_strategy.wait_for(sequence);
+        wait_strategy.wait_for(sequence);
 		available = barrier.get_after(sequence);
 	}
 	fence(Ordering::Acquire);

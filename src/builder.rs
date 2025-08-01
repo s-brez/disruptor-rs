@@ -56,7 +56,7 @@ pub fn build_single_producer<E, W, F>(size: usize, event_factory: F, wait_strate
 where
 	F: FnMut() -> E,
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 {
 	let producer_barrier  = Arc::new(SingleProducerBarrier::new());
 	let dependent_barrier = Arc::clone(&producer_barrier);
@@ -97,7 +97,7 @@ pub fn build_multi_producer<E, W, F>(size: usize, event_factory: F, wait_strateg
 where
 	F: FnMut() -> E,
 	E: 'static + Send + Sync,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 {
 	let producer_barrier  = Arc::new(MultiProducerBarrier::new(size));
 	let dependent_barrier = Arc::clone(&producer_barrier);
@@ -154,7 +154,7 @@ trait Builder<E, W, B>: ProcessorSettings<E, W>
 where
 	E: 'static + Send + Sync,
 	B: 'static + Barrier,
-	W: 'static + WaitStrategy,
+	W: 'static + WaitStrategy + Clone,
 {
 	fn add_event_handler<EH>(&mut self, event_handler: EH)
 	where
