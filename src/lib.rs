@@ -227,7 +227,7 @@ mod producer;
 
 pub use crate::builder::{build_single_producer, build_multi_producer, ProcessorSettings};
 pub use crate::producer::{Producer, RingBufferFull, MissingFreeSlots};
-pub use crate::wait_strategies::{BusySpin, BusySpinWithSpinLoopHint};
+pub use crate::wait_strategies::{BusySpin, BusySpinWithSpinLoopHint, SleepingWaitStrategy, PhasedBackoff};
 pub use crate::producer::{single::SingleProducer, multi::MultiProducer};
 pub use crate::consumer::{SingleConsumerBarrier, MultiConsumerBarrier};
 
@@ -869,5 +869,94 @@ mod tests {
 		for seq_seen_by_pid in 0..expected_sequence_reads {
 			assert_eq!(seq_seen_by_pid, seen_sequences[seq_seen_by_pid as usize]);
 		}
+	}
+	
+	#[derive(Default)]
+	struct SleepEvent {
+	    val: i32,
+	}
+
+	#[test]
+	fn sleeping_wait_strategy_should_wait_for_value() {
+	    let (sender, receiver) = mpsc::channel();
+
+	    let factory = || SleepEvent::default();
+
+	    let processor = move |e: &SleepEvent, _sequence: i64, _end_of_batch: bool| {
+	        sender.send(e.val).expect("should send value");
+	    };
+
+	    let mut producer = build_single_producer(8, factory, SleepingWaitStrategy::default())
+	        .handle_events_with(processor)
+	        .build();
+
+	    thread::scope(|s| {
+	        s.spawn(move || {
+	            thread::sleep(std::time::Duration::from_millis(50));
+	            producer.publish(|e| e.val = 42);
+	        });
+	    });
+
+	    let received = receiver
+	        .recv_timeout(std::time::Duration::from_secs(1))
+	        .expect("did not receive value in time");
+
+	    assert_eq!(received, 42);
+	}
+
+    pub(crate) fn assert_wait_for_with_delay_of(delay_ms: u64) {
+	    let (sender, receiver) = mpsc::channel();
+
+	    #[derive(Default)]
+	    struct Event {
+	        val: i32,
+	    }
+
+	    let factory = || Event::default();
+
+	    let processor = move |e: &Event, _sequence: i64, _end_of_batch: bool| {
+	        sender.send(e.val).expect("should send value");
+	    };
+
+	    let wait_strategy = PhasedBackoff::with_sleep(std::time::Duration::from_millis(1), std::time::Duration::from_millis(1));
+
+	    let mut producer = build_single_producer(8, factory, wait_strategy)
+	        .handle_events_with(processor)
+	        .build();
+
+	    thread::scope(|s| {
+	        s.spawn(move || {
+	            if delay_ms > 0 {
+	                thread::sleep(std::time::Duration::from_millis(delay_ms));
+	            }
+	            producer.publish(|e| e.val = 42);
+	        });
+	    });
+
+	    let received = receiver
+	        .recv_timeout(std::time::Duration::from_secs(1))
+	        .expect("did not receive value in time");
+
+	    assert_eq!(received, 42);
+	}
+
+	#[test]
+	fn phased_backoff_should_handle_immediate_sequence_change() {
+	    assert_wait_for_with_delay_of(0);
+	}
+
+	#[test]
+	fn phased_backoff_should_handle_sequence_change_with_one_millisecond_delay() {
+	    assert_wait_for_with_delay_of(1);
+	}
+
+	#[test]
+	fn phased_backoff_should_handle_sequence_change_with_two_millisecond_delay() {
+	    assert_wait_for_with_delay_of(2);
+	}
+
+	#[test]
+	fn phased_backoff_should_handle_sequence_change_with_ten_millisecond_delay() {
+	    assert_wait_for_with_delay_of(10);
 	}
 }
