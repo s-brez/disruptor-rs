@@ -7,7 +7,7 @@ use criterion::measurement::WallTime;
 use crossbeam::channel::TrySendError::Full;
 use crossbeam::channel::{bounded, TryRecvError::{Empty, Disconnected}};
 use crossbeam_utils::CachePadded;
-use disruptor::{BusySpin, Producer};
+use disruptor::{BusySpin, PhasedBackoff, Producer};
 
 const PRODUCERS:           usize    = 2;
 const DATA_STRUCTURE_SIZE: usize    = 256;
@@ -38,6 +38,7 @@ pub fn mpsc_benchmark(c: &mut Criterion) {
 
 			crossbeam(&mut group, params, &param_description);
 			disruptor(&mut group, params, &param_description);
+			disruptor_phased_backoff(&mut group, params, &param_description);
 		}
 	}
 	group.finish();
@@ -200,7 +201,7 @@ fn disruptor(group: &mut BenchmarkGroup<WallTime>, params: (i64, u64), param_des
 	let producer = disruptor::build_multi_producer(DATA_STRUCTURE_SIZE, factory, BusySpin)
 		.handle_events_with(processor)
 		.build();
-	let benchmark_id        = BenchmarkId::new("disruptor", &param_description);
+    let benchmark_id        = BenchmarkId::new("Disruptor (busy-spin)", &param_description);
 	let burst_size          = Arc::new(AtomicI64::new(0));
 	let mut burst_producers = (0..PRODUCERS)
 		.into_iter()
@@ -222,6 +223,51 @@ fn disruptor(group: &mut BenchmarkGroup<WallTime>, params: (i64, u64), param_des
 	run_benchmark(group, benchmark_id, burst_size, sink, params, &burst_producers);
 
 	burst_producers.iter_mut().for_each(BurstProducer::stop);
+}
+
+/// Benchmark using PhasedBackoff wait strategy (spin -> yield -> sleep)
+fn disruptor_phased_backoff(group: &mut BenchmarkGroup<WallTime>, params: (i64, u64), param_description: &str) {
+    let factory   = || { Event { data: 0 } };
+
+    // Use an AtomicI64 to count number of received events.
+    let sink      = Arc::new(AtomicI64::new(0));
+    let processor = {
+        let sink = Arc::clone(&sink);
+        move |event: &Event, _sequence: i64, _end_of_batch: bool| {
+            black_box(event.data);
+            sink.fetch_add(1, Release);
+        }
+    };
+
+    let wait_strategy = PhasedBackoff::with_sleep(Duration::from_millis(1), Duration::from_millis(1));
+
+    let producer = disruptor::build_multi_producer(DATA_STRUCTURE_SIZE, factory, wait_strategy)
+        .handle_events_with(processor)
+        .build();
+
+    let benchmark_id        = BenchmarkId::new("Disruptor (phased backoff)", &param_description);
+    let burst_size          = Arc::new(AtomicI64::new(0));
+    let mut burst_producers = (0..PRODUCERS)
+        .into_iter()
+        .map(|_| {
+            let burst_size   = Arc::clone(&burst_size);
+            let mut producer = producer.clone();
+            BurstProducer::new(move || {
+                let burst_size = burst_size.load(Acquire);
+                producer.batch_publish(burst_size as usize, |iter| {
+                    for (i, e) in iter.enumerate() {
+                        e.data = black_box(i as i64);
+                    }
+                });
+            })
+        })
+        .collect::<Vec<BurstProducer>>();
+
+    drop(producer);
+
+    run_benchmark(group, benchmark_id, burst_size, sink, params, &burst_producers);
+
+    burst_producers.iter_mut().for_each(BurstProducer::stop);
 }
 
 criterion_group!(mpsc, mpsc_benchmark);

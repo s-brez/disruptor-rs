@@ -8,7 +8,8 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use disruptor::{build_multi_producer, build_single_producer, BusySpin, Producer};
+use disruptor::{build_multi_producer, build_single_producer, BusySpin, PhasedBackoff, Producer};
+use std::time::Duration;
 
 const BUF_SIZE:            usize = 32_768;
 const MAX_PRODUCER_EVENTS: usize = 10_000_000;
@@ -126,6 +127,38 @@ fn disruptor_spsc() {
     sink.load(Ordering::Acquire);
 }
 
+fn disruptor_spsc_phased_backoff() {
+    let factory = || { Event { val: 0 }};
+
+    let sink = Arc::new(AtomicI32::new(0));
+    let processor = {
+        let sink = Arc::clone(&sink);
+        move |event: &Event, _sequence: i64, _end_of_batch: bool| {
+            sink.fetch_add(event.val, Ordering::Release);
+        }
+    };
+
+    let wait_strategy = PhasedBackoff::with_sleep(Duration::from_millis(1), Duration::from_millis(1));
+
+    let mut producer = build_single_producer(BUF_SIZE, factory, wait_strategy)
+        .handle_events_with(processor)
+        .build();
+
+    thread::scope(|s| {
+        s.spawn(move || {
+            for _ in 0..MAX_PRODUCER_EVENTS/BATCH_SIZE {
+                producer.batch_publish(BATCH_SIZE, |iter| {
+                    for e in iter {
+                        e.val = black_box(1);
+                    }
+                });
+            }
+        });
+    });
+
+    sink.load(Ordering::Acquire);
+}
+
 fn disruptor_mpsc() {
     let factory = || { Event { val: 0 }}; //to initialize disruptor
 
@@ -170,9 +203,53 @@ fn disruptor_mpsc() {
     sink.load(Ordering::Acquire);
 }
 
+fn disruptor_mpsc_phased_backoff() {
+    let factory = || { Event { val: 0 }};
+
+    let sink = Arc::new(AtomicI32::new(0));
+    let processor = {
+        let sink = Arc::clone(&sink);
+        move |event: &Event, _sequence: i64, _end_of_batch: bool| {
+            sink.fetch_add(event.val, Ordering::Release);
+        }
+    };
+
+    let wait_strategy = PhasedBackoff::with_sleep(Duration::from_millis(1), Duration::from_millis(1));
+
+    let mut producer1 = build_multi_producer(BUF_SIZE, factory, wait_strategy.clone())
+        .handle_events_with(processor)
+        .build();
+
+    let mut producer2 = producer1.clone();
+
+    thread::scope(|s| {
+        s.spawn(move || {
+            for _ in 0..MAX_PRODUCER_EVENTS/BATCH_SIZE {
+                producer1.batch_publish(BATCH_SIZE, |iter| {
+                    for e in iter {
+                        e.val = black_box(1);
+                    }
+                });
+            }
+        });
+
+        s.spawn(move || {
+            for _ in 0..MAX_PRODUCER_EVENTS/BATCH_SIZE {
+                producer2.batch_publish(BATCH_SIZE, |iter| {
+                    for e in iter {
+                        e.val = 1;
+                    }
+                });
+            }
+        });
+    });
+
+    sink.load(Ordering::Acquire);
+}
+
 
 fn disruptor_spsc_benchmark(c: &mut Criterion) {
-    c.bench_function("disruptor_spsc", |b| {
+    c.bench_function("disruptor_spsc_busy_spin", |b| {
         b.iter(|| {
             disruptor_spsc();
         });
@@ -180,12 +257,36 @@ fn disruptor_spsc_benchmark(c: &mut Criterion) {
 }
 
 fn disruptor_mpsc_benchmark(c: &mut Criterion) {
-    c.bench_function("disruptor_mpsc", |b| {
+    c.bench_function("disruptor_mpsc_busy_spin", |b| {
         b.iter(|| {
             disruptor_mpsc();
         });
     });
 }
 
-criterion_group!(counters, crossbeam_spsc_benchmark, disruptor_spsc_benchmark, crossbeam_mpsc_benchmark, disruptor_mpsc_benchmark);
+fn disruptor_spsc_phased_backoff_benchmark(c: &mut Criterion) {
+    c.bench_function("disruptor_spsc_phased_backoff", |b| {
+        b.iter(|| {
+            disruptor_spsc_phased_backoff();
+        });
+    });
+}
+
+fn disruptor_mpsc_phased_backoff_benchmark(c: &mut Criterion) {
+    c.bench_function("disruptor_mpsc_phased_backoff", |b| {
+        b.iter(|| {
+            disruptor_mpsc_phased_backoff();
+        });
+    });
+}
+
+criterion_group!(counters,
+    crossbeam_spsc_benchmark,
+    disruptor_spsc_benchmark,
+    disruptor_spsc_phased_backoff_benchmark,
+    crossbeam_mpsc_benchmark,
+    disruptor_mpsc_benchmark,
+    disruptor_mpsc_phased_backoff_benchmark,
+);
+
 criterion_main!(counters);

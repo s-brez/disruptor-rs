@@ -6,7 +6,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Benchmark
 use criterion::measurement::WallTime;
 use crossbeam::channel::TrySendError::Full;
 use crossbeam::channel::{bounded, TryRecvError::{Empty, Disconnected}};
-use disruptor::{BusySpin, Producer};
+use disruptor::{BusySpin, PhasedBackoff, Producer};
 
 const DATA_STRUCTURE_SIZE: usize = 128;
 const BURST_SIZES: [u64; 3]      = [1, 10, 100];
@@ -36,6 +36,7 @@ pub fn spsc_benchmark(c: &mut Criterion) {
 
 			crossbeam(&mut group, inputs, &param);
 			disruptor(&mut group, inputs, &param);
+			disruptor_phased_backoff(&mut group, inputs, &param);
 		}
 	}
 	group.finish();
@@ -111,7 +112,7 @@ fn disruptor(group: &mut BenchmarkGroup<WallTime>, inputs: (i64, u64), param: &s
 	let mut producer = disruptor::build_single_producer(DATA_STRUCTURE_SIZE, factory, BusySpin)
 		.handle_events_with(processor)
 		.build();
-	let benchmark_id = BenchmarkId::new("disruptor", &param);
+    let benchmark_id = BenchmarkId::new("Disruptor (busy-spin)", &param);
 	group.bench_with_input(benchmark_id, &inputs, move |b, (size, pause_ms) | b.iter_custom(|iters| {
 		pause(*pause_ms);
 		let start = Instant::now();
@@ -127,6 +128,41 @@ fn disruptor(group: &mut BenchmarkGroup<WallTime>, inputs: (i64, u64), param: &s
 		}
 		start.elapsed()
 	}));
+}
+
+fn disruptor_phased_backoff(group: &mut BenchmarkGroup<WallTime>, inputs: (i64, u64), param: &str) {
+    let factory = || { Event { data: 0 } };
+
+    let sink      = Arc::new(AtomicI64::new(0));
+    let processor = {
+        let sink = Arc::clone(&sink);
+        move |event: &Event, _sequence: i64, _end_of_batch: bool| {
+            sink.store(event.data, Ordering::Release);
+        }
+    };
+
+    let wait_strategy = PhasedBackoff::with_sleep(Duration::from_millis(1), Duration::from_millis(1));
+
+    let mut producer = disruptor::build_single_producer(DATA_STRUCTURE_SIZE, factory, wait_strategy)
+        .handle_events_with(processor)
+        .build();
+
+    let benchmark_id = BenchmarkId::new("Disruptor (phased backoff)", &param);
+    group.bench_with_input(benchmark_id, &inputs, move |b, (size, pause_ms) | b.iter_custom(|iters| {
+        pause(*pause_ms);
+        let start = Instant::now();
+        for _ in 0..iters {
+            producer.batch_publish(*size as usize, |iter| {
+                for (i, e) in iter.enumerate() {
+                    e.data = black_box(i as i64 + 1);
+                }
+            });
+            // Wait for the last data element to be received inside processor.
+            let last_data = black_box(*size);
+            while sink.load(Ordering::Acquire) != last_data {}
+        }
+        start.elapsed()
+    }));
 }
 
 criterion_group!(spsc, spsc_benchmark);
