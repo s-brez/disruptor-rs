@@ -12,7 +12,9 @@
 //!
 //! The Disruptor in this library can only be used once. I.e. it cannot be rewound and restarted.
 //!
-//! It also owns and manages the processing thread(s) for the convenience of the library users.
+//! There is two ways to process events:
+//! 1. Managed threads where the Disruptor owns and manages the processing thread(s) for the convenience of the library users.
+//! 2. Event polling API where the library user controls the processing thread(s).
 //!
 //! ## Setup
 //!
@@ -37,7 +39,7 @@
 //!
 //! # Examples
 //!
-//! ### Basic Usage:
+//! ### Basic Usage
 //!
 //! ```
 //! use disruptor::*;
@@ -110,7 +112,7 @@
 //! }
 //! ```
 //!
-//! ###  Multiple Producers and Multiple, Pinned Consumers:
+//! ###  Multiple Producers and Multiple, Pinned Consumers
 //! ```
 //! use disruptor::*;
 //! use std::thread;
@@ -171,7 +173,7 @@
 //!  // as well.
 //! ```
 //!
-//! ### Adding Custom State That is Neither `Send` Nor `Sync`:
+//! ### Adding Custom State That is Neither `Send` Nor `Sync`
 //!
 //! ```
 //! use std::{cell::RefCell, rc::Rc};
@@ -209,6 +211,48 @@
 //!     });
 //! }
 //! ```
+//!
+//! ### Event Polling API
+//!
+//! ```
+//! use disruptor::*;
+//!
+//! // The data entity on the ring buffer.
+//! #[derive(Debug)]
+//! struct Event {
+//!     price: f64
+//! }
+//!
+//! let factory = || { Event { price: 0.0 }};
+//! let builder = build_single_producer(8, factory, BusySpin);
+//! let (mut event_poller, builder) = builder.event_poller();
+//! let mut producer = builder.build();
+//!
+//! // Publish into the Disruptor.
+//! for i in 0..5 {
+//!     producer.publish(|e| {
+//!         e.price = i as f64;
+//!     });
+//! }
+//! drop(producer); // Drop the producer to signal that no more events will be published.
+//!
+//! // Process events.
+//! loop {
+//!     match event_poller.poll() {
+//!         Ok(mut events) => {
+//!             // Batch process events if efficient in your use case.
+//!             let batch_size = (&mut events).len();
+//!             // Read events with an iterator.
+//!             for event in &mut events {
+//!                 println!("Processing event: {:?}", event);
+//!             }
+//!         },// At this point the EventGuard (here named `events`) is dropped,
+//!           // signaling the Disruptor that the events have been processed.
+//!         Err(Polling::NoEvents) => { /* Do other work or try again. */ },
+//!         Err(Polling::Shutdown) => { break; }, // Exit the loop if the Disruptor is shut down.
+//!     }
+//! }
+//! ```
 
 #![deny(rustdoc::broken_intra_doc_links)]
 #![warn(missing_docs)]
@@ -230,6 +274,7 @@ pub use crate::producer::{Producer, RingBufferFull, MissingFreeSlots};
 pub use crate::wait_strategies::{BusySpin, BusySpinWithSpinLoopHint, SleepingWaitStrategy, PhasedBackoff};
 pub use crate::producer::{single::SingleProducer, multi::MultiProducer};
 pub use crate::consumer::{SingleConsumerBarrier, MultiConsumerBarrier};
+pub use crate::consumer::event_poller::{EventPoller, Polling, EventGuard};
 
 #[cfg(test)]
 mod tests {
@@ -240,9 +285,7 @@ mod tests {
 	use std::sync::atomic::Ordering::Relaxed;
 	use std::sync::{mpsc, Arc};
 	use std::thread;
-
 	use producer::MissingFreeSlots;
-
 	use super::*;
 
 	#[derive(Debug)]
@@ -786,7 +829,137 @@ mod tests {
 		assert_eq!(vec![1, 1, 3, 3, 5, 5, 11, 12, 21, 22, 31, 32], result);
 	}
 
-	#[cfg_attr(miri, ignore)]
+	#[test]
+	fn spmc_with_event_pollers() {
+		let builder       = build_single_producer(8, factory(), BusySpin);
+		let (mut ep1, b)  = builder.event_poller();
+		let (mut ep2, b)  = b.and_then().event_poller();
+		let (mut ep3, b)  = b.and_then().event_poller();
+		let mut producer  = b.build();
+
+		// Polling before publication should yield no events.
+		assert_eq!(ep1.poll().err(), Some(Polling::NoEvents));
+		assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+		assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+
+		// Publish two events.
+		producer.publish(|e| { e.num = 1; });
+		producer.publish(|e| { e.num = 2; });
+
+		let expected = vec![1, 2];
+
+		{// Only first poller sees events.
+			let mut guard_1 = ep1.poll().ok().unwrap();
+			assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(expected, guard_1.map(|e| e.num).collect::<Vec<_>>());
+		}
+
+		{// Now second poller sees events.
+			let mut guard_2 = ep2.poll().ok().unwrap();
+			assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(expected, guard_2.map(|e| e.num).collect::<Vec<_>>());
+		}
+
+		{// Now third poller sees events.
+			let mut guard_3 = ep3.poll().ok().unwrap();
+			assert_eq!(expected, guard_3.map(|e| e.num).collect::<Vec<_>>());
+		}
+
+		// Dropping the producer should indicate shutdown to all pollers.
+		drop(producer);
+		assert_eq!(ep1.poll().err(), Some(Polling::Shutdown));
+		assert_eq!(ep2.poll().err(), Some(Polling::Shutdown));
+		assert_eq!(ep3.poll().err(), Some(Polling::Shutdown));
+	}
+
+	#[test]
+	fn mpmc_with_event_pollers() {
+		let builder       = build_multi_producer(64, factory(), BusySpin);
+		let (mut ep1, b)  = builder.event_poller();
+		let (mut ep2, b)  = b.and_then().event_poller();
+		let (mut ep3, b)  = b.and_then().event_poller();
+		let mut producer1 = b.build();
+		let mut producer2 = producer1.clone();
+
+		// Polling before publication should yield no events.
+		assert_eq!(ep1.poll().err(), Some(Polling::NoEvents));
+		assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+		assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+
+		// Publish two events.
+		producer1.publish(|e| { e.num = 1; });
+		producer2.publish(|e| { e.num = 2; });
+
+		let expected = HashSet::from([1, 2]);
+
+		{// Only first poller sees events.
+			let mut guard_1 = ep1.poll().ok().unwrap();
+			assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(expected, guard_1.map(|e| e.num).collect::<HashSet<_>>());
+		}
+
+		{// Now second poller sees events.
+			let mut guard_2 = ep2.poll().ok().unwrap();
+			assert_eq!(ep3.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(expected, guard_2.map(|e| e.num).collect::<HashSet<_>>());
+		}
+
+		{// Now third poller sees events.
+			let mut guard_3 = ep3.poll().ok().unwrap();
+			assert_eq!(expected, guard_3.map(|e| e.num).collect::<HashSet<_>>());
+		}
+
+		// Dropping the producers should indicate shutdown to all pollers.
+		drop(producer1);
+		drop(producer2);
+		assert_eq!(ep1.poll().err(), Some(Polling::Shutdown));
+		assert_eq!(ep2.poll().err(), Some(Polling::Shutdown));
+		assert_eq!(ep3.poll().err(), Some(Polling::Shutdown));
+	}
+
+	#[test]
+	fn spmc_with_mixed_event_pollers_and_processors() {
+		let (s, r)       = mpsc::channel();
+		let processor1   = move |e: &Event, _, _| { s.send(e.num).unwrap(); };
+
+		let builder      = build_single_producer(8, factory(), BusySpin)
+			.handle_events_with(processor1);
+		let (mut ep1, b) = builder.event_poller();
+		let (mut ep2, b) = b.and_then().event_poller();
+		let mut producer = b.build();
+
+		// Polling before publication should yield no events.
+		assert_eq!(ep1.poll().err(), Some(Polling::NoEvents));
+		assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+
+		// Publish two events.
+		producer.publish(|e| { e.num = 1; });
+		producer.publish(|e| { e.num = 2; });
+		drop(producer);
+
+		let expected = vec![1, 2];
+
+		{// Only first poller sees events.
+			let mut guard_1 = ep1.poll().ok().unwrap();
+			assert_eq!(ep2.poll().err(), Some(Polling::NoEvents));
+			assert_eq!(expected, guard_1.map(|e| e.num).collect::<Vec<_>>());
+		}
+		// Next poll should indicate shutdown to the poller.
+		assert_eq!(ep1.poll().err(), Some(Polling::Shutdown));
+
+		{// Now second poller sees events.
+			let mut guard_2 = ep2.poll().ok().unwrap();
+			assert_eq!(expected, guard_2.map(|e| e.num).collect::<Vec<_>>());
+		}
+
+		let mut result: Vec<i64> = r.iter().collect();
+		result.sort();
+		assert_eq!(expected, result);
+	}
+
+	#[cfg_attr(miri, ignore)]// Miri disabled due to excessive runtime.
 	#[test]
 	fn stress_test() {
 		#[derive(Debug)]
